@@ -1,0 +1,770 @@
+#!/bin/bash
+
+# Configuration file
+# You need to correctly set all the paths before using crash-setup
+CFG=(
+    "/etc/crash-setuprc"
+    "$HOME/.crash-setuprc"
+)
+
+for conf in "${CFG[@]}"; do
+    if [ -r "$conf" ]; then
+	source "$conf"
+    fi
+done
+
+# set missing config variables to default values
+KERNEL_REPO="${KERNEL_REPO-/space/kernel-source}"
+GROUP_OWNER="${GROUP_OWNER-suse}"
+FCS_BASE="${FCS_BASE-/mounts/schnell/CD-ARCHIVE}"
+FCS_DBG_BASE="${FCS_DBG_BASE-/work/built/dists/all}"
+UPDATE_BASE="${UPDATE_BASE-/mounts/mirror/SuSE/zypp-patches.suse.de}"
+UPDATE_BASE_NCC="${UPDATE_BASE_NCC-/mounts/mirror/SuSE/build-ncc.suse.de/SUSE/Updates}"
+SLE12_BASE="${SLE12_BASE-/mounts/dist/ibs/SUSE}"
+PTF_BASE="${PTF_BASE-/mounts/ptf}"
+if [ -z "${BRANCH+set}" ]; then
+    BRANCH=(
+	SLES9-SP4-LTSS
+	SLES10_SP2_LTSS
+	SLES10_SP3_LTSS
+	SLES10-SP3-TD
+	SLES10-SP4-LTSS
+	SLE11-SP1-LTSS
+	SLE11-SP1-TD
+	SLE11-SP2-LTSS
+	SLE11-SP3
+	SLE11-SP3-TD
+	SLE11-SP4
+	SLE12
+	SLE12-SP1
+	NOTFOUND
+    )
+fi
+
+# where to store extracted RPMs
+EXTRACTED_BASEDIR="/var/cache/crash-setup"
+
+# current script name
+sn="${0##*/}"
+
+# colors on current terminal
+if [ -z "$CRASH_SETUP_NOCOLORS" ]; then
+    GREEN="$(tput setaf 10)"
+    RED="$(tput setaf 9)"
+    YELLOW="$(tput setaf 11)"
+    NONE="$(tput sgr0)"
+else
+    GREEN=""
+    RED=""
+    YELLOW=""
+    NONE=""
+fi
+
+ptf_url2path() {
+    for i in "$@";do
+        if [[ "$i" =~ "ptf.suse.com" ]] ; then
+            echo "$i" | sed -e "s,https*://ptf.suse.com/,$PTF_BASE/,"
+        else
+            echo "$i" | sed -e "s,https://you.novell.com/update,$PTF_BASE/old,"
+        fi
+    done
+}
+
+remote_ptfdb() {
+    ssh -T ptfdb@l3support.nue.suse.com "$@"
+}
+
+# find commit hash which was tagged by name in git
+tag_to_commit() {
+#   $1  git tag name
+    local out
+    out="$(git --git-dir="$KERNEL_REPO/.git" log -n 1 --pretty=format:%H "${1}" 2>&1)" || return
+    echo "$out"
+}
+
+# find the oldest branch with the tagged commit
+tag_to_branch() {
+#   $1  git tag name
+    local i=0
+    local commit="$(tag_to_commit "$1")"
+
+    if [ -z "$commit" ]; then
+        err "Tag '$1' not found."
+        return 1
+    fi
+    until git --git-dir "$KERNEL_REPO/.git" log --pretty=format:%H "origin/${BRANCH[i]}" | grep "$commit" > /dev/null; do
+        i=$((i + 1))
+        if [ "${BRANCH[i]}" = NOTFOUND ]; then
+            err "Tag '$1' not found in any defined branch."
+            return 2
+        fi
+    done
+    echo "${BRANCH[i]}"
+}
+
+# construct sles version and service pack number from branch name
+branch_to_dist() {
+#   $1  branch name
+    read sver ssp < <(sed 's@[^0123456789]\+@ @g' <<< "$1")
+    if [ -z "$ssp" ]; then
+        ssp=0
+    fi
+}
+
+# read kernel dump and find the proper version
+read_dump() {
+#   $1  kernel dump to prepare for
+    local Arch Format Version
+
+    # if we can't read dump, we can do nothing
+    if [ ! -r "$1" ]; then
+        err "Cannot read '$1'"
+        exit 25
+    fi
+
+    kdump_out="$(kdumpid "$1")"
+    if [ $? -ne 0 ]; then
+	err "Problem reading dump '$1'"
+	if [ "$kdump_out" ]; then
+	    err "output"$'\n'"$kdump_out"
+	fi
+	exit 30
+    fi
+
+    # set proper permissions for kernel dump file
+    # feature request by mhocko@suse.cz
+    chmod ug+r "$1"
+
+    # transform all the information to shell variables
+    eval $(sed 's@^\([^:]\+\): \(.*\)@\1="\2"@' <<< "$kdump_out" )
+    arch="$Arch"
+    # build service has its own architecture logic, thanks
+    bs_arch="${arch/i386/i586}"
+    echo "arch: $arch"
+    kver="${Version%-*}"
+    echo "kernel version: ${kver}"
+    kflv="${Version##*-}"
+    echo "flavour: $kflv"
+
+    # is it PTF, TEST package or commin release?
+    if [[ $kver =~ \.(PTF|TEST)(\..*)?$ ]]; then
+        ptf=true
+        echo "package type: ${BASH_REMATCH[1]}"
+        if [[ $kver =~ ^[^-]+-.*\.([0-9]+)\.([0-9]+)\.(PTF|TEST)(\..*)?$ ]]; then
+            ptf_id="${BASH_REMATCH[1]}"
+            ptf_seq="${BASH_REMATCH[2]}"
+            echo "PTF project number: $ptf_id"
+            echo "PTF sequence number: $ptf_seq"
+        else
+            echo "pattern not identified - '$kver'"
+        fi
+    else
+        ptf=false
+        echo "package type: release"
+
+	branch="$(tag_to_branch "rpm-$kver")" || exit 35
+	echo "branch: $branch"
+	branch_to_dist "$branch"
+	echo "SLE version: $sver"
+	echo "SLE service pack: $ssp"
+    fi
+}
+
+err() {
+    echo "${RED}${sn}: $*${NONE}" >&2
+}
+
+warn() {
+    echo "${YELLOW}${sn}: $*${NONE}" >&2
+}
+
+# run ptfdb ls command and split output into $line
+get_ptfdb() {
+#   $@	arguments for ptfdb call
+    local IFS line0
+
+    IFS='|'
+    read line0 < <( $PTFDB ls -t "$@" )
+    line=($line0)
+}
+
+
+# split a line using "|" as a delimiter into $line
+split_line() {
+# parameters ignored
+    local IFS line0 ret
+
+    IFS='|'
+    read line0
+    ret=$?
+    line=($line0)
+
+    return $ret
+}
+
+# wrapper around ln -s
+fix_link() {
+#   $1	symlink target
+#   $2	symlink file
+    if [ ! -e "$1" ]; then
+        err "'$1' does not exist"
+        return 1
+    fi
+
+    if [ -L "$2" -o -e "$2" ]; then
+        if ! $dryrun && ! rm -f "$2"; then
+            err "failed to remove existing '$2'"
+            return 1
+        fi
+    fi
+    $dryrun || ln -sv "$1" "$2"
+}
+
+
+unpack_rpm() {
+#   $1	RPM file with full path
+    if $dryrun; then
+	if [ -f "$1" ]; then
+	    echo "DRY RUN: '$1' - OK"
+	else
+	    echo "DRY RUN: '$1' - FAIL"
+	fi
+	return
+    fi
+
+    test -f "$1" || return 1
+    filename="${1##*/}"
+
+    # was the RPM to be unpacked already processed in the past?
+    local m1=" $filename "
+    local m2=" ${unpacked_rpms[*]} "
+    if [[ $m2 =~ $m1 ]]; then
+	echo "already processed '$1'"
+	return 0
+    fi
+
+    unpacked_rpms[${#unpacked_rpms[@]}]="${1##*/}"
+    no_rpm=false
+    echo "unpacking $1"
+    rpm2cpio "$1" | cpio -id
+}
+
+add_dir() {
+#   $1	type of directory (std, dbg)
+#   $2	directory to add
+
+# sets $stdrpm_dirs and $dbgrpm_dirs
+    local dirs
+    if [ ! -d "$2" ]; then echo "omitting non-existing '$2' ($1)"; return; fi
+    dirs="${1}rpm_dirs"
+    eval "$dirs[\${#$dirs[@]}]='$2'"
+}
+
+
+add_sle10_repos() {
+    add_dir std "${UPDATE_BASE}/${arch}/update/SLE-SERVER/${sver}${repo_sp}/rpm/${bs_arch}"
+    add_dir dbg "${UPDATE_BASE}/${arch}/update/SLE-DEBUGINFO/${sver}${repo_sp}/rpm/${bs_arch}"
+
+    case "${ssp}" in
+	0)
+	    add_dir std "${FCS_BASE}/SLES${sver}/SLE-10-SP${ssp}/SLES-${sver}${repo_sp}-GM/${arch}/DVD1/suse/${bs_arch}" ;;
+	1)
+	    add_dir std "${FCS_BASE}/SLES${sver}/SLE-10-SP${ssp}/SLES-${sver}${repo_sp}-GM/${arch}/DVD1/suse/${bs_arch}" ;;
+	2)
+	    add_dir std "${FCS_BASE}/SLES${sver}/SLE-10-SP${ssp}/SLES-${sver}${repo_sp}-GM/${arch}/DVD1/suse/${bs_arch}"
+	    add_dir std "${UPDATE_BASE}/${arch}/update/SLE-SERVER/${sver}${repo_sp}-LTSS/rpm/${bs_arch}"
+            add_dir dbg "${UPDATE_BASE}/${bs_arch}/update/SLE-DEBUGINFO/${sver}${repo_sp}-POOL/rpm/${bs_arch}" ;;
+	3)
+	    add_dir std "${FCS_BASE}/SLES${sver}/SLE-10-SP${ssp}/SLES-${sver}${repo_sp}-GM/${arch}/DVD1/suse/${bs_arch}"
+	    add_dir dbg "${UPDATE_BASE}/${bs_arch}/update/SLE-DEBUGINFO/${sver}${repo_sp}-POOL/rpm/${bs_arch}"
+       	    add_dir std "${UPDATE_BASE}/${arch}/update/SLE-SERVER/${sver}${repo_sp}/rpm/${bs_arch}"
+	    add_dir dbg "${UPDATE_BASE}/${arch}/update/SLE-DEBUGINFO/${sver}${repo_sp}/rpm/${bs_arch}"
+	    # LTSS updates (debuginfo is located in the repository above)
+       	    add_dir std "${UPDATE_BASE}/${arch}/update/SLE-SERVER/${sver}${repo_sp}-LTSS/rpm/${bs_arch}" ;;
+	4)
+	    add_dir std "${FCS_BASE}/SLES${sver}/SLE-10-SP${ssp}/SLES-${sver}${repo_sp}-GM/${arch}/DVD1/suse/${bs_arch}"
+	    add_dir dbg "${UPDATE_BASE}/${bs_arch}/update/SLE-DEBUGINFO/${sver}${repo_sp}-POOL/rpm/${bs_arch}"
+	    # SLES11 SP4 has SP4-POOL, thanks for that
+	    add_dir std "${UPDATE_BASE}/${arch}/update/SLE-SERVER/${sver}${repo_sp}-POOL/rpm/${arch}"
+	    add_dir dbg "${UPDATE_BASE}/${arch}/update/SLE-DEBUGINFO/${sver}${repo_sp}-POOL/rpm/${arch}"
+	    # LTSS
+    	    add_dir std "${UPDATE_BASE}/${arch}/update/SLE-SERVER/${sver}${repo_sp}-LTSS/rpm/${arch}"
+	    ;;
+	*)
+	    err "Unexpected service pack '$ssp'"
+	    exit 1 ;;
+    esac
+}
+
+add_sle11_repos() {
+    add_dir std "${FCS_BASE}/SLE${sver}/SLES-${sver}${repo_sp}-GM/${arch}/DVD1/suse/${bs_arch}"
+    add_dir dbg "${UPDATE_BASE}/${bs_arch}/update/SLE-DEBUGINFO/${sver}-POOL/rpm/${bs_arch}"
+    # Updates
+    add_dir std "${UPDATE_BASE_NCC}/SLE-SERVER/${sver}${repo_sp}/${bs_arch}/update/rpm/${bs_arch}"
+    add_dir dbg "${UPDATE_BASE_NCC}/SLE-DEBUGINFO/${sver}${repo_sp}/${bs_arch}/update/rpm/${bs_arch}"
+
+    if [ "${ssp}" -eq 4 ]; then
+	add_dir std "${UPDATE_BASE}/${arch}/update/SLE-SERVER/${sver}${repo_sp}-POOL/rpm/${bs_arch}"
+	add_dir dbg "${UPDATE_BASE}/${arch}/update/SLE-DEBUGINFO/${sver}${repo_sp}-POOL/rpm/${bs_arch}"
+    else
+	add_dir std "${UPDATE_BASE}/${arch}/update/SLE-SERVER/${sver}${repo_sp}/rpm/${bs_arch}"
+	add_dir dbg "${UPDATE_BASE}/${arch}/update/SLE-DEBUGINFO/${sver}${repo_sp}/rpm/${bs_arch}"
+
+	# LTSS updates
+	add_dir std "${UPDATE_BASE_NCC}/SLE-SERVER/${sver}${repo_sp}-LTSS/${bs_arch}/update/rpm/${bs_arch}"
+    fi
+}
+
+add_sle12_repos() {
+    # Release
+    add_dir std "${SLE12_BASE}/Products/SLE-SERVER/${sver}${repo_sp}/${bs_arch}/product/${bs_arch}"
+    add_dir dbg "${SLE12_BASE}/Products/SLE-SERVER/${sver}${repo_sp}/${bs_arch}/product_debug/${bs_arch}"
+
+    # Updates
+    add_dir std "${SLE12_BASE}/Updates/SLE-SERVER/${sver}${repo_sp}/${bs_arch}/update/${bs_arch}"
+    add_dir dbg "${SLE12_BASE}/Updates/SLE-SERVER/${sver}${repo_sp}/${bs_arch}/update_debug/${bs_arch}"
+
+    # Updates LTSS
+    add_dir std "${SLE12_BASE}/Updates/SLE-SERVER/${sver}${repo_sp}-LTSS/${bs_arch}/update/${bs_arch}"
+    add_dir dbg "${SLE12_BASE}/Updates/SLE-SERVER/${sver}${repo_sp}-LTSS/${bs_arch}/update_debug/${bs_arch}"
+}
+
+create_dirlists_rel() {
+# expects:
+#  $sver
+#  $ssp
+#  $repo_sp
+#  $arch
+#  $bs_arch
+#  $kflv
+#  $kver
+# to be defined
+    local repo_sp_lc="$(echo -n "$repo_sp" | tr '[:upper:]' '[:lower:]')"
+
+    stdrpm_dirs=()
+    dbgrpm_dirs=()
+
+    case "${sver}" in
+	10) add_sle10_repos ;;
+	11) add_sle11_repos ;;
+	12) add_sle12_repos ;;
+    esac
+
+    # Teradata!
+    if $teradata; then
+	if [ "${sver}" -eq 10 -a "${ssp}" -lt 3 ] || \
+	       [ "${sver}" -eq 11 -a "${ssp}" -eq 1 ] || \
+	       [ "${sver}" -eq 11 -a "${ssp}" -eq 3 ]; then
+	    add_dir std "${UPDATE_BASE}/${arch}/update/SLE-SERVER/${sver}${repo_sp}-TERADATA/rpm/${arch}"
+	    add_dir dbg "${UPDATE_BASE}/${arch}/update/SLE-DEBUGINFO/${sver}${repo_sp}-TERADATA/rpm/${arch}"
+	else
+	    err "I don't know where to look for updates for this Teradata codestream"
+	fi
+    fi
+}
+
+
+create_dirlists_ptf() {
+# expects:
+#  $ptf_id
+#  $ptf_seq
+#  $build_id
+    local aux
+
+    get_ptfdb pkg --project_id "$ptf_id" --seq "$ptf_seq"
+    if [ "${line[2]}" != "kernel-source" ]; then
+        err "unexpected package '${line[2]}'"
+        exit 2
+    fi
+    kver="${line[4]}"
+    ptf_type="${line[6]}"
+    pkg_id="$[${line[0]}]"
+
+    while split_line; do
+        if [ ${line[2]} = "kernel-${kflv}.spec" -a "${line[3]}" = "$arch" ]; then
+            break
+        fi
+    done < <($PTFDB ls -t build --package_id "$pkg_id")
+    if [ -z "${line[1]}" ]; then
+        err "no build for PTF:${ptf_id}.${ptf_seq} ${arch}/${kflv}"
+        exit 2
+    fi
+    build_id="$[${line[0]}]"
+
+    while split_line; do
+        d="$(ptf_url2path "${line[3]}")"
+        add_dir std "$d"
+        add_dir dbg "$d"
+    done < <($PTFDB ls -t publish --build_id "$build_id")
+}
+
+usage() {
+    cat <<EOF
+Tool to prepare environment for running crash.
+
+ ${sn} [-x | -D | -h | --execute | --dry-run | --help] [-pd | --ptf | --dump] ...
+
+Prepare environment based on provided information about version:
+  usage:     ${sn} <sles_version> <sp> <kernel_version> <kernel_flavor> [arch]
+  example:   ${sn} 11 2 3.0.93-0.5 default i386
+
+Prepare environment based on information about PTF:
+  usage:     ${sn} -p <ptf_id> <ptf_seq> <kernel_flavor>
+  example:   ${sn} -p 6238 0 xen
+
+
+Prepare environmand based on kernel core dump file:
+  usage:     ${sn} [-x] -d <dump file>
+  example:   ${sn} -d vmcore
+
+    -x|--execute     execute crash after the environment is prepared
+    -D|--dry-run     do not write any data
+    -r|--force-renew if there exist target directory, remove it first,
+                     note that it takes preference over --dry-run
+    -h|--help        show this help screen
+
+EOF
+}
+
+if ( IFS=$'\n'; echo "$*" ) | grep -E '^(-h|--help)$' &> /dev/null; then
+    usage
+    exit 0
+fi
+
+# configuration sanity check
+correct=true
+if [ ! -d "$KERNEL_REPO/.git" ]; then
+    correct=false
+    err "KERNEL_REPO doesn't seem to be valid GIT repository"
+fi
+
+for dir in FCS_BASE FCS_DBG_BASE UPDATE_BASE EXTRACTED_BASEDIR; do
+    if [ ! -d "${!dir}" -o ! -r "${!dir}" ]; then
+	correct=false
+	err "$dir is not correctly set or directory is not readable"
+	err "$dir is set to '${!dir}'"
+    fi
+done
+if ! $correct; then
+    cat <<EOF >&2
+check if NFS is mounted or adjust your configuration in $CFG
+
+configuration is not correct, aborting...
+EOF
+    exit 1
+fi
+
+if which ptfdb &> /dev/null; then
+    PTFDB=ptfdb
+else
+    PTFDB=remote_ptfdb
+fi
+
+# initialize important variables
+execute=false
+dryrun=false
+renew=false
+mode=version
+arch=x86_64
+bs_arch=x86_64
+
+if [ -z "$1" ]; then
+    usage
+    exit 1
+fi
+
+# read the options
+TEMP="$(getopt -o hrxpdD --long help,ptf,force-renew,dump,execute,dry-run -- "$@")"
+if [ $? -ne 0 ]; then
+    exit 1
+fi
+
+eval set -- "$TEMP"
+
+while true; do
+    case "$1" in
+	-h|--help)
+	    usage
+	    exit 0;;
+	-p|--ptf)
+	    shift
+	    mode=ptf;;
+	-d|--dump)
+	    shift
+	    mode=dump;;
+	-x|--execute)
+	    shift
+	    execute=true;;
+	-D|--dry-run)
+	    shift
+	    dryrun=true;;
+	-r|--force-renew)
+	    shift
+	    renew=true;;
+	--)
+	    shift
+	    break ;;
+    esac
+done
+
+if $renew && $dryrun; then
+    warn "--force-renew and --dry-run was set at the same time and it doesn't make sense, ignoring --dry-run"
+    dryrun=false
+fi
+
+case "$mode" in
+    ptf)
+	if [ $# -ne 3 ]; then
+	    err "Unexpected number of arguments in PTF mode"
+	    exit 1
+	fi
+	ptf=true
+	ptf_id="$[$1]"
+	ptf_seq="$[$2]"
+	kflv="$3"
+	execute=false ;;
+    dump)
+	if [ $# -ne 1 ]; then
+	    err "Unexpected number of arguments in dump mode"
+	    exit 1
+	fi
+	ptf=false
+	dump="$1"
+	read_dump "$dump";;
+    version)
+	if [ $# -ne 4 ] && [ $# -ne 5 ]; then
+	    err "Unexpected number of arguments in version mode"
+	    exit 1
+	fi
+	ptf=false
+	sver="$[$1]"
+	ssp="$[$2]"
+	kver="$3"
+	kflv="$4"
+	if [ "$5" ]; then
+	    arch="$5"
+	    bs_arch="${arch//i386/i586}"
+	fi
+	execute=false ;;
+esac
+
+# cheap to run
+if $dryrun || [ ! -d "$EXTRACTED_BASEDIR" ]; then
+    mkdir -p "$EXTRACTED_BASEDIR"
+    chmod ug+rwx "$EXTRACTED_BASEDIR"
+fi
+
+
+# be ready for Teradata
+if [[ $kver =~ \.TDC ]]; then
+    teradata=true
+else
+    teradata=false
+fi
+
+if [[ $kver =~ 2\.6\.5-7\.286\.TDC\.[0-9]+\.R ]] || [[ $kver =~ \.TDC\.R ]]; then
+    echo "It is well possible that '$kver' is internal Teradata kernel rebuild, you won't find matching kernel binaries."
+    while read -p "Try anyway? (Y/n): " answer; do
+	case $answer in
+	    [Nn]*)
+		exit 0;;
+	    *)
+		break ;;
+	esac
+    done
+fi
+
+if $ptf; then
+    get_ptfdb prj "$ptf_id"
+    if [ "${line[1]#sle}" = "${line[1]}" ]; then
+        err "unexpected product '${line[1]}'"
+        exit 2
+    fi
+    if [ "${line[2]}" != "$arch" ]; then
+        warn "unexpected architecture '${line[2]}'"
+    fi
+    aux="${line[1]%%-*}"
+    sver="$[${aux#sle[sd]}]"
+    aux="${line[1]#*-}"
+    aux="${aux%%-*}"
+    if [ "$aux" = "ga" ]; then
+        ssp=0
+    else
+        ssp="$[${aux#sp}]"
+    fi
+fi
+
+if [ "$sver" -lt 11 ] || "$ptf"; then
+    # rpm version and uname are the same before SLE11
+    xrel=""
+else
+    xrel="*"
+fi
+
+if [ $ssp -gt 0 ]; then
+    repo_sp="-SP${ssp}"
+    repo_sp_lc="-sp${ssp}"
+else
+    # GA
+    repo_sp=""
+    repo_sp_lc=""
+fi
+
+if $ptf; then
+    create_dirlists_ptf
+    target_dir="$EXTRACTED_BASEDIR/ptf/${ptf_id}.${ptf_seq}-${kflv}"
+    if [ ! -d "$EXTRACTED_BASEDIR"/ptf ]; then
+	if ! $dryrun; then
+	    mkdir "$EXTRACTED_BASEDIR"/ptf
+	    chgrp "$GROUP_OWNER" "$EXTRACTED_BASEDIR"/ptf
+	    chmod ug+rwx "$EXTRACTED_BASEDIR"/ptf
+	fi
+    fi
+
+    echo "target: $target_dir"
+
+    std_rpms=(
+	"'kernel-${kflv}-base-${kver}.${ptf_id}.${ptf_seq}.'*'.${bs_arch}.rpm'"
+        "'kernel-${kflv}-${kver}.${ptf_id}.${ptf_seq}.'*'.${bs_arch}.rpm'"
+    )
+    dbg_rpms=(
+	"'kernel-${kflv}-devel-debuginfo-${kver}.${ptf_id}.${ptf_seq}.'*'.${bs_arch}.rpm'"
+        "'kernel-${kflv}-debuginfo-${kver}.${ptf_id}.${ptf_seq}.'*'.${bs_arch}.rpm'"
+    )
+else
+    create_dirlists_rel
+    target_dir="$EXTRACTED_BASEDIR/${sver}sp${ssp}/${kver}-${kflv}"
+    std_rpms=(
+	"'kernel-${kflv}-base-${kver}'${xrel}'.${bs_arch}.rpm'"
+        "'kernel-${kflv}-${kver}'${xrel}'.${bs_arch}.rpm'"
+    )
+    dbg_rpms=(
+	"'kernel-${kflv}-devel-debuginfo-${kver}'${xrel}'.${bs_arch}.rpm'"
+        "'kernel-${kflv}-debuginfo-${kver}'${xrel}'.${bs_arch}.rpm'"
+    )
+fi
+
+if [ ! -d "$target_dir" ] || $renew; then
+
+    if [ "${#stdrpm_dirs[@]}" -eq 0 ]; then
+        err "no standard RPM directory found (SLES ${sver} SP ${ssp})"
+        exit 2
+    fi
+
+    if [ "${#dbgrpm_dirs[@]}" -eq 0 ]; then
+        err "no debug RPM directory found (SLES ${sver} SP ${ssp})"
+        exit 2
+    fi
+
+    if [ -d "$target_dir" ]; then
+	echo "wiping $target_dir before renewal"
+	rm -r "$target_dir"
+    fi
+
+    echo "target directory $target_dir does not exist, creating it..."
+    if ! $dryrun && ! mkdir -p "$target_dir"; then
+        err "failed to create target directory '$target_dir'"
+        exit 3
+    fi
+
+    no_rpm=true
+    $dryrun || pushd "$target_dir" >/dev/null
+    for d in "${stdrpm_dirs[@]}"; do
+        for f in "${std_rpms[@]}"; do
+            eval unpack_rpm "${d}/${f}"
+        done
+    done
+    for d in "${dbgrpm_dirs[@]}"; do
+        for f in "${dbg_rpms[@]}"; do
+            eval unpack_rpm "${d}/${f}"
+        done
+    done
+    $dryrun || popd >/dev/null
+
+    if $no_rpm; then
+        err "no matching rpm found in"
+        for d in "${stdrpm_dirs[@]}"; do echo "    (std) $d" >&2; done
+        for d in "${dbgrpm_dirs[@]}"; do echo "    (dbg) $d" >&2; done
+        $dryrun || rmdir -v "$target_dir"
+        exit 2
+    fi
+
+    if ! $dryrun; then
+	chgrp -R "$GROUP_OWNER" "$target_dir"
+	chmod -R a+rX,ug+w "$target_dir"
+    fi
+
+    echo "${GREEN}target directory $target_dir created sucessfully${NONE}"
+
+else
+
+    echo "${GREEN}target directory $target_dir already exists${NONE}"
+
+fi
+
+fix_link "$target_dir" root
+if $ptf; then
+   # proper version string should look like:
+   # Note that bnc is not mandatory because only <=SLES10 PTFs were using them
+   # ${kver}.${ptf_id}.${ptf_seq}.${ptf_type}[.bnc]-${kflv}
+
+   uname_ver_part="${kver}.${ptf_id}.${ptf_seq}.${ptf_type}"
+   uname_ver="$(
+	   ls "root/boot/vmlinux-${uname_ver_part}"*"-${kflv}.gz" | \
+	       sed -n "s@root/boot/vmlinux-\(.*\)\.gz\$@\1@p")"
+   if [ -z "${uname_ver}" ]; then
+       err "Can't locate package with any bug number"
+       exit 2
+   fi
+   # fi
+   # uname_ver="${kver}.${ptf_id}.${ptf_seq}.${ptf_type}.${bug_number}-${kflv}"
+else
+   uname_ver="${kver}-${kflv}"
+fi
+
+if [ -f "root/boot/vmlinux-${uname_ver}.gz" ]; then
+    fix_link "root/boot/vmlinux-${uname_ver}.gz" vmlinux.gz
+else
+    warn "Cannot estimate kernel file easily (RPM version and kernel version string is different)."
+    while read posibility; do
+	posibilities[${#posibilities[@]}]="$posibility"
+    done < <(ls -1 root/boot/vmlinux-*.gz 2>/dev/null)
+    case "${#posibilities[@]}" in
+	0)
+	    err "Cannot find any candidates for kernel file." ;;
+	1)
+	    echo "${GREEN}Good candidate is: ${posibilities[0]}${NONE}"
+	    fix_link "${posibilities[0]}" vmlinux.gz
+	    uname_ver="$(sed "s@.*/vmlinux-\(.*\)-${kflv}.gz@\1@" <<< "${posibilities[0]}")-${kflv}"
+	    echo "${GREEN}Detected kernel version:${NONE} $uname_ver";;
+	*)
+	    err "There seem to be more matching choices:"
+	    for pos in "${posibilities[@]}"; do
+		echo "  ${pos}"
+	    done ;;
+    esac
+    execute=false
+fi
+
+fix_link "root/usr/lib/debug/boot/vmlinux-${uname_ver}.debug" vmlinux.debug
+fix_link "root/lib/modules/${uname_ver}" modules
+fix_link "root/usr/lib/debug/lib/modules/${uname_ver}" modules.debug
+
+if [ "$dump" ]; then
+    if $execute; then
+	current_arch="$(uname -m)"
+	if [ "$current_arch" == "$bs_arch" ]; then
+	    exec crash vmlinux.gz vmlinux.debug "$dump"
+	elif [ "$current_arch" == "x86_64" -a "$bs_arch" == "i586" ] && which crash32 &> /dev/null; then
+	    exec crash32 vmlinux.gz vmlinux.debug "$dump"
+	else
+	    echo "Cannot start crash as the dump is for different architecture."
+	fi
+    else
+	cat <<EOF
+Now you can start the crash:
+crash vmlinux.gz vmlinux.debug $dump
+EOF
+    fi
+fi
+
